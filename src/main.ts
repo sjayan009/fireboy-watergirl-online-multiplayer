@@ -254,6 +254,7 @@ function syncPresence(): void {
   }
 
   players = nextPlayers;
+  maybeStartFromConsensus();
   render();
 }
 
@@ -310,19 +311,7 @@ function toggleReady(): void {
     seq: nextSeq()
   } satisfies ReadyPayload);
 
-  if (ready && canStart()) {
-    const startsAt = Date.now() + 1200;
-    startedAt = startsAt;
-    void trackPresence();
-    void sendGameEvent({
-      type: "start",
-      playerId,
-      startsAt,
-      seq: nextSeq()
-    } satisfies StartPayload);
-    scheduleStart(startsAt);
-  }
-
+  maybeStartFromConsensus();
   render();
 }
 
@@ -330,6 +319,32 @@ function canStart(): boolean {
   const present = [...players.values()];
   const roles = new Set(present.map((player) => player.role).filter(Boolean));
   return present.length >= 2 && roles.has("fireboy") && roles.has("watergirl") && present.every((player) => player.ready);
+}
+
+function maybeStartFromConsensus(): void {
+  if (startedAt !== null || !ready || !canStart() || !isStartCoordinator()) {
+    return;
+  }
+
+  const startsAt = Date.now() + 1200;
+  startedAt = startsAt;
+  void trackPresence();
+  void sendGameEvent({
+    type: "start",
+    playerId,
+    startsAt,
+    seq: nextSeq()
+  } satisfies StartPayload);
+  scheduleStart(startsAt);
+}
+
+function isStartCoordinator(): boolean {
+  const readyPlayerIds = [...players.values()]
+    .filter((player) => player.ready && player.role)
+    .map((player) => player.playerId)
+    .sort();
+
+  return readyPlayerIds[0] === playerId;
 }
 
 function handleRemoteEvent(event: GameEvent): void {
@@ -582,8 +597,8 @@ function renderOverlay(): void {
     return;
   }
 
-  els.overlayTitle.textContent = "Ready";
-  els.overlayCopy.textContent = "Press ready to synchronize the start.";
+  els.overlayTitle.textContent = "Starting together";
+  els.overlayCopy.textContent = "Both players are ready. Syncing the game start now.";
 }
 
 function isRoleTaken(role: Role): boolean {
