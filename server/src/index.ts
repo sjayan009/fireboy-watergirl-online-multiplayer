@@ -89,6 +89,18 @@ server.listen(port, host, () => {
 async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
+  if (url.pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(statusPageHtml());
+    return;
+  }
+
+  if (url.pathname === "/favicon.ico") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (url.pathname === "/health") {
     sendJson(res, 200, { ok: true, rooms: rooms.size, clients: clients.size });
     return;
@@ -524,6 +536,40 @@ function clamp(value: number, min: number, max: number): number {
   }
 
   return Math.max(min, Math.min(max, value));
+}
+
+function statusPageHtml(): string {
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Fireboy & Watergirl Game Host</title>
+    <style>
+      :root { color-scheme: dark; font-family: Arial, sans-serif; background: #0b0d12; color: #f4f6fb; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+      main { width: min(560px, calc(100vw - 32px)); border: 1px solid #2a3140; border-radius: 8px; padding: 28px; background: #141821; }
+      h1 { margin: 0 0 10px; font-size: 28px; }
+      p { margin: 8px 0; color: #b7bfce; line-height: 1.5; }
+      a { color: #ffdc6b; font-weight: 700; }
+      dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 20px 0 0; }
+      dt { color: #8d96a8; }
+      dd { margin: 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Game host online</h1>
+      <p>This Fly.io service runs the shared cloud game session. Open the public Vercel app to play.</p>
+      <p><a href="https://fireboy-watergirl-the-forest-temple.vercel.app">Open Fireboy & Watergirl Online</a></p>
+      <dl>
+        <dt>Rooms</dt><dd>${rooms.size}</dd>
+        <dt>Clients</dt><dd>${clients.size}</dd>
+        <dt>Health</dt><dd><a href="/health">/health</a></dd>
+      </dl>
+    </main>
+  </body>
+</html>`;
 }
 
 function hostPageHtml(): string {
