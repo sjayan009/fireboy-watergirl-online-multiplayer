@@ -17,6 +17,9 @@ A two-player online wrapper for the original Flash SWF using Ruffle, Vite, and S
    VITE_SUPABASE_PUBLISHABLE_KEY=
    ```
 
+   The Supabase project created for this app is `fireboy-watergirl-online`
+   (`https://eoduegtnnumegswjpski.supabase.co`).
+
 3. Start the app:
 
    ```bash
@@ -24,6 +27,12 @@ A two-player online wrapper for the original Flash SWF using Ruffle, Vite, and S
    ```
 
 4. Open two browser windows to the same room URL and choose different roles.
+
+5. Verify Supabase Realtime from Node:
+
+   ```bash
+   npm run smoke:realtime
+   ```
 
 ## Multiplayer Model
 

@@ -1,15 +1,6 @@
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const PLAYER_KEY = "fw-online-player-id";
-
 export function getOrCreatePlayerId(): string {
-  const existing = localStorage.getItem(PLAYER_KEY);
-  if (existing) {
-    return existing;
-  }
-
-  const playerId = crypto.randomUUID();
-  localStorage.setItem(PLAYER_KEY, playerId);
-  return playerId;
+  return crypto.randomUUID();
 }
 
 export function getInitialRoom(): string {
