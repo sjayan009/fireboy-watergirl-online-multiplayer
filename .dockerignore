@@ -1,0 +1,16 @@
+.git
+.agents
+.vercel
+dist
+node_modules
+server/node_modules
+*.log
+.env
+.env.*
+!/.env.example
+00_coverscreenshot.png
+00_coverscreenshot_thumb.jpg
+Fireboy & Watergirl - The Forest Temple.swf
+fireboy-watergirl-the-forest-temple_202401_*
+screenshot_*.png
+screenshot_*_thumb.jpg

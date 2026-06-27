@@ -9,6 +9,8 @@ The public Vercel site is only the viewer/controller. The actual game runs once 
 - Frontend: Vite + TypeScript, deployed on Vercel.
 - Game host: Node + Playwright + WebSocket, intended for Fly.io.
 - One room creates one server-side Chromium page.
+- v1 runs as a single Fly machine because room state and Chromium pages are in memory.
+- The Fly machine is configured with 2 GB RAM so Chromium/Ruffle cold starts have breathing room.
 - Fireboy controls: ArrowLeft / ArrowUp / ArrowRight.
 - Watergirl controls: A / W / D.
 - Pointer events on the streamed game view are forwarded to the hosted game so players can click the in-game menu.
