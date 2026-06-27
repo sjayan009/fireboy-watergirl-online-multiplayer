@@ -23,6 +23,7 @@ type ServerPlayer = {
 const playerId = getOrCreatePlayerId();
 let room = getInitialRoom();
 let selectedRole: Role | null = null;
+let desiredReady = false;
 let ready = false;
 let phase: Phase = "lobby";
 let startsAt: number | null = null;
@@ -160,6 +161,7 @@ function bindUi(): void {
     window.history.pushState(null, "", url);
     room = nextRoom;
     selectedRole = null;
+    desiredReady = false;
     ready = false;
     phase = "lobby";
     startsAt = null;
@@ -240,6 +242,7 @@ function handleServerMessage(message: ServerMessage): void {
     const own = players.find((player) => player.id === selfId);
     selectedRole = own?.role ?? selectedRole;
     ready = Boolean(own?.ready);
+    reconcileDesiredState(own);
     render();
     return;
   }
@@ -260,6 +263,7 @@ function handleServerMessage(message: ServerMessage): void {
     pressed.clear();
     phase = "lobby";
     startsAt = null;
+    desiredReady = false;
     ready = false;
     render();
     return;
@@ -272,7 +276,9 @@ function handleServerMessage(message: ServerMessage): void {
   }
 
   if (message.type === "error") {
+    desiredReady = ready;
     showToast(message.message);
+    render();
   }
 }
 
@@ -296,6 +302,7 @@ function chooseRole(role: Role): void {
 
   const nextRole = selectedRole === role ? null : role;
   selectedRole = nextRole;
+  desiredReady = false;
   ready = false;
   send({ type: "claim_role", role: nextRole });
   render();
@@ -307,8 +314,10 @@ function toggleReady(): void {
     return;
   }
 
-  ready = !ready;
-  send({ type: "ready", ready });
+  desiredReady = !(desiredReady || ready);
+  if (!send({ type: "ready", ready: desiredReady })) {
+    showToast("Reconnecting. Ready will sync when the room reconnects.");
+  }
   render();
 }
 
@@ -363,13 +372,17 @@ function stopPing(): void {
   }
 }
 
-function send(payload: unknown): void {
+function send(payload: unknown): boolean {
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(payload));
+    return true;
   }
+
+  return false;
 }
 
 function render(): void {
+  const readyPending = desiredReady && !ready && phase !== "playing";
   els.roomCode.textContent = room;
   els.connection.textContent = connectionLabel(connectionState);
   els.latency.textContent = lastLatencyMs === null ? "--" : `${lastLatencyMs} ms`;
@@ -379,8 +392,9 @@ function render(): void {
   els.roleFireboy.disabled = isRoleTaken("fireboy") && selectedRole !== "fireboy";
   els.roleWatergirl.disabled = isRoleTaken("watergirl") && selectedRole !== "watergirl";
 
-  els.ready.textContent = ready ? "Unready" : "Ready";
-  els.overlayReady.textContent = ready ? "Unready" : "Ready";
+  const readyLabel = ready ? "Unready" : readyPending ? "Syncing..." : "Ready";
+  els.ready.textContent = readyLabel;
+  els.overlayReady.textContent = readyLabel;
   els.ready.disabled = !selectedRole || phase === "playing";
   els.overlayReady.disabled = !selectedRole || phase === "playing";
 
@@ -450,6 +464,12 @@ function renderOverlay(): void {
     return;
   }
 
+  if (desiredReady && !ready) {
+    els.overlayTitle.textContent = "Syncing ready state";
+    els.overlayCopy.textContent = "Confirming your ready status with the shared game host.";
+    return;
+  }
+
   els.overlayTitle.textContent = ready ? "Waiting for your partner" : "Ready up";
   els.overlayCopy.textContent =
     "Both players need different characters and ready status before the shared game unlocks.";
@@ -457,6 +477,29 @@ function renderOverlay(): void {
 
 function isRoleTaken(role: Role): boolean {
   return players.some((player) => player.id !== selfId && player.role === role);
+}
+
+function reconcileDesiredState(own: ServerPlayer | undefined): void {
+  if (phase === "playing") {
+    desiredReady = ready;
+    return;
+  }
+
+  const serverRole = own?.role ?? null;
+  const serverReady = Boolean(own?.ready);
+
+  if (selectedRole && serverRole !== selectedRole && !isRoleTaken(selectedRole)) {
+    send({ type: "claim_role", role: selectedRole });
+    return;
+  }
+
+  if (desiredReady && !serverReady && serverRole) {
+    window.setTimeout(() => {
+      if (desiredReady && !ready && phase === "lobby") {
+        send({ type: "ready", ready: true });
+      }
+    }, 250);
+  }
 }
 
 function gameServerUrl(): string | null {
