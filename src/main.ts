@@ -1,39 +1,41 @@
-import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
 import "./styles.css";
-import { keyLabels, roleForKey, roleKeys, roleLabels } from "./keys";
+import { keyLabels, roleKeys, roleLabels } from "./keys";
 import { createRoomCode, getInitialRoom, getOrCreatePlayerId, roomUrl } from "./room";
-import { RuffleHost } from "./ruffle";
-import type {
-  ConnectionState,
-  GameEvent,
-  PlayerPresence,
-  ReadyPayload,
-  Role,
-  RolePayload,
-  StartPayload
-} from "./types";
+import type { ConnectionState, Role } from "./types";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
-const hasSupabaseConfig = Boolean(supabaseUrl && supabaseKey);
+type Phase = "lobby" | "starting" | "playing";
+
+type ServerMessage =
+  | { type: "connected"; playerId: string }
+  | { type: "room_state"; room: string; selfId: string; phase: Phase; startsAt: number | null; players: ServerPlayer[] }
+  | { type: "frame"; mime: string; width: number; height: number; data: string }
+  | { type: "start"; startsAt: number }
+  | { type: "reset" }
+  | { type: "error"; message: string }
+  | { type: "pong"; sentAt: number; receivedAt: number };
+
+type ServerPlayer = {
+  id: string;
+  role: Role | null;
+  ready: boolean;
+};
 
 const playerId = getOrCreatePlayerId();
 let room = getInitialRoom();
 let selectedRole: Role | null = null;
 let ready = false;
-let startedAt: number | null = null;
-let connectionState: ConnectionState = hasSupabaseConfig ? "connecting" : "offline";
-let channel: RealtimeChannel | null = null;
-let ruffleHost: RuffleHost | null = null;
-let seq = 0;
-let lastLatencyMs: number | null = null;
+let phase: Phase = "lobby";
+let startsAt: number | null = null;
+let connectionState: ConnectionState = "connecting";
+let socket: WebSocket | null = null;
+let reconnectTimer: number | null = null;
 let pingTimer: number | null = null;
 let toastTimer: number | null = null;
+let lastLatencyMs: number | null = null;
+let selfId = playerId;
+let players: ServerPlayer[] = [];
 
-const remoteSeq = new Map<string, number>();
 const pressed = new Set<string>();
-let players = new Map<string, PlayerPresence>();
-
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -45,7 +47,7 @@ app.innerHTML = `
     <aside class="panel" aria-label="Room controls">
       <div class="brand">
         <h1>Fireboy & Watergirl Online</h1>
-        <p>Two-player remote co-op through a shared invite room.</p>
+        <p>One cloud-hosted game session, two remote controllers.</p>
       </div>
 
       <section class="section">
@@ -102,12 +104,14 @@ app.innerHTML = `
         <button id="focus-game" class="secondary" type="button">Focus Game</button>
       </div>
       <div class="game-wrap">
-        <div id="game-frame" class="game-frame"></div>
+        <div id="game-frame" class="game-frame">
+          <canvas id="stream-canvas" width="640" height="480" aria-label="Cloud game stream"></canvas>
+        </div>
       </div>
       <div id="overlay" class="overlay">
         <div class="overlay-card">
-          <h2 id="overlay-title">Waiting for players</h2>
-          <p id="overlay-copy" class="muted">Choose a character, share the room link, and press ready when both of you are here.</p>
+          <h2 id="overlay-title">Connecting</h2>
+          <p id="overlay-copy" class="muted">Connecting to the cloud game host.</p>
           <button id="overlay-ready" type="button">Ready</button>
         </div>
       </div>
@@ -130,34 +134,18 @@ const els = {
   roleStatus: byId("role-status"),
   keyStatus: byId("key-status"),
   focusGame: byId<HTMLButtonElement>("focus-game"),
-  gameFrame: byId("game-frame"),
+  canvas: byId<HTMLCanvasElement>("stream-canvas"),
   overlay: byId("overlay"),
   overlayTitle: byId("overlay-title"),
   overlayCopy: byId("overlay-copy"),
   overlayReady: byId<HTMLButtonElement>("overlay-ready")
 };
 
-void boot();
+const canvasContext = els.canvas.getContext("2d");
 
-async function boot(): Promise<void> {
-  ruffleHost = new RuffleHost(els.gameFrame);
-  try {
-    await ruffleHost.load();
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : "Could not load the game.");
-  }
-
-  bindUi();
-  render();
-
-  if (hasSupabaseConfig) {
-    await connectRoom(room);
-  } else {
-    players.set(playerId, ownPresence());
-    showToast("Add Supabase env vars to enable online rooms.");
-    render();
-  }
-}
+bindUi();
+connect();
+render();
 
 function bindUi(): void {
   els.copyLink.addEventListener("click", async () => {
@@ -171,9 +159,11 @@ function bindUi(): void {
     url.searchParams.set("room", nextRoom);
     window.history.pushState(null, "", url);
     room = nextRoom;
+    selectedRole = null;
     ready = false;
-    startedAt = null;
-    void connectRoom(room);
+    phase = "lobby";
+    startsAt = null;
+    connect();
     render();
   });
 
@@ -181,101 +171,121 @@ function bindUi(): void {
   els.roleWatergirl.addEventListener("click", () => chooseRole("watergirl"));
   els.ready.addEventListener("click", toggleReady);
   els.overlayReady.addEventListener("click", toggleReady);
-  els.reset.addEventListener("click", () => sendReset());
-  els.focusGame.addEventListener("click", () => ruffleHost?.focus());
-  els.gameFrame.addEventListener("pointerdown", () => ruffleHost?.focus());
+  els.reset.addEventListener("click", () => send({ type: "reset" }));
+  els.focusGame.addEventListener("click", () => els.canvas.focus());
+  els.canvas.addEventListener("pointerdown", (event) => sendPointer("down", event));
+  els.canvas.addEventListener("pointerup", (event) => sendPointer("up", event));
+  els.canvas.addEventListener("pointercancel", (event) => sendPointer("up", event));
+  els.canvas.tabIndex = 0;
 
   window.addEventListener("keydown", handleLocalKey, { capture: true });
   window.addEventListener("keyup", handleLocalKey, { capture: true });
 }
 
-async function connectRoom(nextRoom: string): Promise<void> {
+function connect(): void {
   stopPing();
-  players = new Map();
-  remoteSeq.clear();
-
-  if (channel) {
-    await channel.unsubscribe();
-    channel = null;
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 
-  if (!hasSupabaseConfig) {
+  socket?.close();
+  connectionState = "connecting";
+  const url = gameServerUrl();
+
+  if (!url) {
     connectionState = "offline";
-    players.set(playerId, ownPresence());
+    showToast("Set VITE_GAME_SERVER_URL to connect to the cloud host.");
     render();
     return;
   }
 
-  connectionState = "connecting";
-  render();
+  socket = new WebSocket(url);
 
-  const supabase = createClient(supabaseUrl!, supabaseKey!);
-  channel = supabase.channel(`fw-room:${nextRoom}`, {
-    config: {
-      presence: { key: playerId },
-      broadcast: { self: false, ack: true }
-    }
+  socket.addEventListener("open", () => {
+    connectionState = "connected";
+    send({ type: "join_room", room });
+    startPing();
+    render();
   });
 
-  channel
-    .on("presence", { event: "sync" }, syncPresence)
-    .on("presence", { event: "join" }, syncPresence)
-    .on("presence", { event: "leave" }, syncPresence)
-    .on("broadcast", { event: "game" }, ({ payload }) => handleRemoteEvent(payload as GameEvent))
-    .subscribe(async (status) => {
-      if (status === "SUBSCRIBED") {
-        connectionState = "connected";
-        await trackPresence();
-        startPing();
-        render();
-        return;
-      }
+  socket.addEventListener("message", (event) => {
+    handleServerMessage(JSON.parse(event.data as string) as ServerMessage);
+  });
 
-      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        connectionState = "degraded";
-        render();
-      }
-    });
+  socket.addEventListener("close", () => {
+    connectionState = "degraded";
+    stopPing();
+    render();
+    reconnectTimer = window.setTimeout(connect, 1500);
+  });
+
+  socket.addEventListener("error", () => {
+    connectionState = "degraded";
+    render();
+  });
 }
 
-function syncPresence(): void {
-  if (!channel) {
+function handleServerMessage(message: ServerMessage): void {
+  if (message.type === "connected") {
+    selfId = message.playerId;
     return;
   }
 
-  const state = channel.presenceState<PlayerPresence>();
-  const nextPlayers = new Map<string, PlayerPresence>();
-
-  for (const [key, presences] of Object.entries(state)) {
-    const latest = presences[presences.length - 1];
-    if (latest) {
-      nextPlayers.set(latest.playerId || key, latest);
-    }
-  }
-
-  players = nextPlayers;
-  maybeStartFromConsensus();
-  render();
-}
-
-async function trackPresence(): Promise<void> {
-  if (!channel) {
-    players.set(playerId, ownPresence());
+  if (message.type === "room_state") {
+    selfId = message.selfId;
+    players = message.players;
+    phase = message.phase;
+    startsAt = message.startsAt;
+    const own = players.find((player) => player.id === selfId);
+    selectedRole = own?.role ?? selectedRole;
+    ready = Boolean(own?.ready);
+    render();
     return;
   }
 
-  await channel.track(ownPresence());
+  if (message.type === "frame") {
+    drawFrame(message);
+    return;
+  }
+
+  if (message.type === "start") {
+    startsAt = message.startsAt;
+    phase = "starting";
+    render();
+    return;
+  }
+
+  if (message.type === "reset") {
+    pressed.clear();
+    phase = "lobby";
+    startsAt = null;
+    ready = false;
+    render();
+    return;
+  }
+
+  if (message.type === "pong") {
+    lastLatencyMs = Math.max(0, Date.now() - message.sentAt);
+    render();
+    return;
+  }
+
+  if (message.type === "error") {
+    showToast(message.message);
+  }
 }
 
-function ownPresence(): PlayerPresence {
-  return {
-    playerId,
-    name: "Player",
-    role: selectedRole,
-    ready,
-    startedAt,
-    onlineAt: new Date().toISOString()
+function drawFrame(frame: Extract<ServerMessage, { type: "frame" }>): void {
+  if (!canvasContext) {
+    return;
+  }
+
+  const image = new Image();
+  image.onload = () => {
+    canvasContext.drawImage(image, 0, 0, els.canvas.width, els.canvas.height);
   };
+  image.src = `data:${frame.mime};base64,${frame.data}`;
 }
 
 function chooseRole(role: Role): void {
@@ -284,15 +294,10 @@ function chooseRole(role: Role): void {
     return;
   }
 
-  selectedRole = selectedRole === role ? null : role;
+  const nextRole = selectedRole === role ? null : role;
+  selectedRole = nextRole;
   ready = false;
-  void trackPresence();
-  void sendGameEvent({
-    type: "role",
-    playerId,
-    role: selectedRole,
-    seq: nextSeq()
-  } satisfies RolePayload);
+  send({ type: "claim_role", role: nextRole });
   render();
 }
 
@@ -303,204 +308,51 @@ function toggleReady(): void {
   }
 
   ready = !ready;
-  void trackPresence();
-  void sendGameEvent({
-    type: "ready",
-    playerId,
-    ready,
-    seq: nextSeq()
-  } satisfies ReadyPayload);
-
-  maybeStartFromConsensus();
+  send({ type: "ready", ready });
   render();
 }
 
-function canStart(): boolean {
-  const present = [...players.values()];
-  const roles = new Set(present.map((player) => player.role).filter(Boolean));
-  return present.length >= 2 && roles.has("fireboy") && roles.has("watergirl") && present.every((player) => player.ready);
-}
-
-function maybeStartFromConsensus(): void {
-  if (startedAt !== null || !ready || !canStart() || !isStartCoordinator()) {
-    return;
-  }
-
-  const startsAt = Date.now() + 1200;
-  startedAt = startsAt;
-  void trackPresence();
-  void sendGameEvent({
-    type: "start",
-    playerId,
-    startsAt,
-    seq: nextSeq()
-  } satisfies StartPayload);
-  scheduleStart(startsAt);
-}
-
-function isStartCoordinator(): boolean {
-  const readyPlayerIds = [...players.values()]
-    .filter((player) => player.ready && player.role)
-    .map((player) => player.playerId)
-    .sort();
-
-  return readyPlayerIds[0] === playerId;
-}
-
-function handleRemoteEvent(event: GameEvent): void {
-  if (event.playerId === playerId) {
-    return;
-  }
-
-  const lastSeq = remoteSeq.get(event.playerId) ?? -1;
-  if ("seq" in event && event.seq <= lastSeq) {
-    return;
-  }
-  if ("seq" in event) {
-    remoteSeq.set(event.playerId, event.seq);
-  }
-
-  if (event.type === "input") {
-    ruffleHost?.inject(event.code, event.action);
-    if (event.action === "down") {
-      pressed.add(`${event.playerId}:${event.code}`);
-    } else {
-      pressed.delete(`${event.playerId}:${event.code}`);
-    }
-    return;
-  }
-
-  if (event.type === "start") {
-    startedAt = event.startsAt;
-    scheduleStart(event.startsAt);
-    render();
-    return;
-  }
-
-  if (event.type === "reset") {
-    ready = false;
-    startedAt = event.startsAt;
-    releaseAllKeys();
-    ruffleHost?.reload();
-    void trackPresence();
-    render();
-    return;
-  }
-
-  if (event.type === "ping") {
-    void sendGameEvent({
-      type: "pong",
-      playerId,
-      to: event.playerId,
-      sentAt: event.sentAt,
-      receivedAt: Date.now(),
-      seq: nextSeq()
-    });
-    return;
-  }
-
-  if (event.type === "pong" && event.to === playerId) {
-    lastLatencyMs = Math.max(0, Date.now() - event.sentAt);
-    render();
-  }
-}
-
 function handleLocalKey(event: KeyboardEvent): void {
-  if (!event.isTrusted || !selectedRole || !startedAt || Date.now() < startedAt) {
-    return;
-  }
-
-  const keyRole = roleForKey(event.code);
-  if (keyRole !== selectedRole) {
+  if (!selectedRole || phase !== "playing" || !roleKeys[selectedRole].includes(event.code)) {
     return;
   }
 
   const action = event.type === "keydown" ? "down" : "up";
-  const pressKey = `${playerId}:${event.code}`;
-  if (action === "down" && pressed.has(pressKey)) {
+  if (action === "down" && pressed.has(event.code)) {
     event.preventDefault();
     return;
   }
 
   if (action === "down") {
-    pressed.add(pressKey);
+    pressed.add(event.code);
   } else {
-    pressed.delete(pressKey);
+    pressed.delete(event.code);
   }
 
   event.preventDefault();
-  ruffleHost?.inject(event.code, action);
-
-  void sendGameEvent({
-    type: "input",
-    playerId,
-    role: selectedRole,
-    code: event.code,
-    action,
-    seq: nextSeq(),
-    sentAt: Date.now()
-  });
+  send({ type: "input_key", code: event.code, action });
 }
 
-async function sendGameEvent(payload: GameEvent): Promise<void> {
-  if (!channel || connectionState !== "connected") {
+function sendPointer(action: "down" | "up", event: PointerEvent): void {
+  if (phase !== "playing") {
     return;
   }
 
-  const status = await channel.send({
-    type: "broadcast",
-    event: "game",
-    payload
+  const rect = els.canvas.getBoundingClientRect();
+  send({
+    type: "pointer",
+    action,
+    x: (event.clientX - rect.left) / rect.width,
+    y: (event.clientY - rect.top) / rect.height
   });
-
-  if (status !== "ok") {
-    connectionState = "degraded";
-    render();
-  }
-}
-
-function sendReset(): void {
-  ready = false;
-  startedAt = null;
-  releaseAllKeys();
-  ruffleHost?.reload();
-  void trackPresence();
-  void sendGameEvent({
-    type: "reset",
-    playerId,
-    startsAt: null,
-    seq: nextSeq()
-  });
-  render();
-}
-
-function scheduleStart(startsAtValue: number): void {
-  const delay = Math.max(0, startsAtValue - Date.now());
-  window.setTimeout(() => {
-    ruffleHost?.focus();
-    render();
-  }, delay);
-}
-
-function releaseAllKeys(): void {
-  for (const value of pressed) {
-    const [, code] = value.split(":");
-    if (code) {
-      ruffleHost?.inject(code, "up");
-    }
-  }
-  pressed.clear();
+  els.canvas.focus();
+  event.preventDefault();
 }
 
 function startPing(): void {
   stopPing();
   pingTimer = window.setInterval(() => {
-    void sendGameEvent({
-      type: "ping",
-      playerId,
-      sentAt: Date.now(),
-      seq: nextSeq()
-    });
+    send({ type: "ping", sentAt: Date.now() });
   }, 4000);
 }
 
@@ -511,12 +363,13 @@ function stopPing(): void {
   }
 }
 
-function render(): void {
-  const own = ownPresence();
-  if (!channel) {
-    players.set(playerId, own);
+function send(payload: unknown): void {
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(payload));
   }
+}
 
+function render(): void {
   els.roomCode.textContent = room;
   els.connection.textContent = connectionLabel(connectionState);
   els.latency.textContent = lastLatencyMs === null ? "--" : `${lastLatencyMs} ms`;
@@ -528,8 +381,8 @@ function render(): void {
 
   els.ready.textContent = ready ? "Unready" : "Ready";
   els.overlayReady.textContent = ready ? "Unready" : "Ready";
-  els.ready.disabled = !selectedRole;
-  els.overlayReady.disabled = !selectedRole;
+  els.ready.disabled = !selectedRole || phase === "playing";
+  els.overlayReady.disabled = !selectedRole || phase === "playing";
 
   els.roleStatus.textContent = selectedRole
     ? `You are ${roleLabels[selectedRole]}`
@@ -543,12 +396,13 @@ function render(): void {
 }
 
 function renderPlayers(): void {
-  const rows = [...players.values()]
-    .sort((a, b) => a.playerId.localeCompare(b.playerId))
+  const rows = players
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id))
     .map((player) => {
       const roleClass = player.role ?? "";
       const role = player.role ? roleLabels[player.role] : "No role";
-      const self = player.playerId === playerId ? "You" : "Partner";
+      const self = player.id === selfId ? "You" : "Partner";
       return `
         <div class="player-row">
           <div>
@@ -568,14 +422,19 @@ function renderPlayers(): void {
 }
 
 function renderOverlay(): void {
-  const startInMs = startedAt ? startedAt - Date.now() : null;
-  const hasStarted = startedAt !== null && startInMs !== null && startInMs <= 0;
-
-  els.overlay.hidden = hasStarted;
-
-  if (hasStarted) {
+  if (connectionState !== "connected") {
+    els.overlay.hidden = false;
+    els.overlayTitle.textContent = "Connecting";
+    els.overlayCopy.textContent = "Connecting to the cloud game host.";
     return;
   }
+
+  if (phase === "playing") {
+    els.overlay.hidden = true;
+    return;
+  }
+
+  els.overlay.hidden = false;
 
   if (!selectedRole) {
     els.overlayTitle.textContent = "Choose your character";
@@ -583,36 +442,51 @@ function renderOverlay(): void {
     return;
   }
 
-  if (startedAt && startInMs !== null && startInMs > 0) {
+  if (phase === "starting" && startsAt) {
+    const startInMs = Math.max(0, startsAt - Date.now());
     els.overlayTitle.textContent = "Starting together";
-    els.overlayCopy.textContent = `Game starts in ${(startInMs / 1000).toFixed(1)} seconds.`;
+    els.overlayCopy.textContent = `Game unlocks in ${(startInMs / 1000).toFixed(1)} seconds.`;
     window.setTimeout(render, 150);
     return;
   }
 
-  if (!canStart()) {
-    els.overlayTitle.textContent = ready ? "Waiting for your partner" : "Ready up";
-    els.overlayCopy.textContent =
-      "Both players need different characters and ready status before the game starts.";
-    return;
-  }
-
-  els.overlayTitle.textContent = "Starting together";
-  els.overlayCopy.textContent = "Both players are ready. Syncing the game start now.";
+  els.overlayTitle.textContent = ready ? "Waiting for your partner" : "Ready up";
+  els.overlayCopy.textContent =
+    "Both players need different characters and ready status before the shared game unlocks.";
 }
 
 function isRoleTaken(role: Role): boolean {
-  return [...players.values()].some((player) => player.playerId !== playerId && player.role === role);
+  return players.some((player) => player.id !== selfId && player.role === role);
 }
 
-function nextSeq(): number {
-  seq += 1;
-  return seq;
+function gameServerUrl(): string | null {
+  const configured = import.meta.env.VITE_GAME_SERVER_URL as string | undefined;
+  const base =
+    configured ||
+    (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+      ? "ws://127.0.0.1:8080"
+      : "");
+
+  if (!base) {
+    return null;
+  }
+
+  const url = new URL(base);
+  if (url.protocol === "http:") {
+    url.protocol = "ws:";
+  }
+  if (url.protocol === "https:") {
+    url.protocol = "wss:";
+  }
+  if (url.pathname === "/" || !url.pathname) {
+    url.pathname = "/ws";
+  }
+  return url.toString();
 }
 
 function connectionLabel(state: ConnectionState): string {
   if (state === "offline") {
-    return "Local only";
+    return "No host";
   }
 
   if (state === "connecting") {
@@ -620,7 +494,7 @@ function connectionLabel(state: ConnectionState): string {
   }
 
   if (state === "degraded") {
-    return "Degraded";
+    return "Reconnecting";
   }
 
   return "Connected";

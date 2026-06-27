@@ -1,55 +1,85 @@
 # Fireboy & Watergirl Online
 
-A two-player online wrapper for the original Flash SWF using Ruffle, Vite, and Supabase Realtime.
+A true remote co-op wrapper for the original Flash SWF.
+
+The public Vercel site is only the viewer/controller. The actual game runs once in a persistent cloud host service, where a Playwright/Chromium page loads the SWF through Ruffle. Both players connect to that one hosted game session, watch the same frame stream, and send controls for their chosen character.
+
+## Architecture
+
+- Frontend: Vite + TypeScript, deployed on Vercel.
+- Game host: Node + Playwright + WebSocket, intended for Fly.io.
+- One room creates one server-side Chromium page.
+- Fireboy controls: ArrowLeft / ArrowUp / ArrowRight.
+- Watergirl controls: A / W / D.
+- Pointer events on the streamed game view are forwarded to the hosted game so players can click the in-game menu.
 
 ## Local Setup
 
-1. Install dependencies:
+Install frontend dependencies:
 
-   ```bash
-   npm install
-   ```
+```bash
+npm install
+```
 
-2. Copy `.env.example` to `.env` and fill in:
+Install host dependencies:
 
-   ```bash
-   VITE_SUPABASE_URL=
-   VITE_SUPABASE_PUBLISHABLE_KEY=
-   ```
+```bash
+npm install --prefix server
+```
 
-   The Supabase project created for this app is `fireboy-watergirl-online`
-   (`https://eoduegtnnumegswjpski.supabase.co`).
+Copy `.env.example` to `.env` for production-style config, or use this for local development:
 
-3. Start the app:
+```bash
+VITE_GAME_SERVER_URL=ws://127.0.0.1:8080
+```
 
-   ```bash
-   npm run dev
-   ```
+Run the host service:
 
-4. Open two browser windows to the same room URL and choose different roles.
+```bash
+npm run server:dev
+```
 
-5. Verify Supabase Realtime from Node:
+Run the frontend in another terminal:
 
-   ```bash
-   npm run smoke:realtime
-   ```
+```bash
+npm run dev
+```
 
-## Multiplayer Model
+Open the same room URL from two browsers/devices.
 
-- Room URLs use `/?room=ABC123`.
-- Supabase Broadcast carries input events.
-- Supabase Presence carries role, ready, and connection state.
-- The SWF remains closed-source, so both browsers run local Ruffle instances and receive the same input stream.
+## Verification
 
-If Ruffle/browser synthetic keyboard events stop being accepted in a future Ruffle build, the fallback is to rebuild the game in a modern engine with authoritative networked state.
+Frontend build:
 
-## Vercel
+```bash
+npm run build
+```
 
-Set these environment variables in Vercel:
+Host TypeScript build:
 
-- `VITE_SUPABASE_URL`
-- `VITE_SUPABASE_PUBLISHABLE_KEY`
+```bash
+npm run server:build
+```
 
-Build command: `npm run build`
+End-to-end host smoke test:
 
-Output directory: `dist`
+```bash
+npm run smoke:host
+```
+
+## Deployment
+
+Deploy the host service to Fly.io from the repo root:
+
+```bash
+fly launch --copy-config
+fly deploy
+```
+
+Set the Vercel frontend env var:
+
+```bash
+VITE_GAME_SERVER_URL=wss://fireboy-watergirl-game-host.fly.dev
+```
+
+Then redeploy Vercel.
