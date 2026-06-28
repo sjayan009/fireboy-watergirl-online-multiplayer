@@ -8,7 +8,7 @@ type Phase = "lobby" | "starting" | "playing";
 type ServerMessage =
   | { type: "connected"; playerId: string }
   | { type: "room_state"; room: string; selfId: string; phase: Phase; startsAt: number | null; players: ServerPlayer[] }
-  | { type: "frame"; mime: string; width: number; height: number; data: string }
+  | { type: "frame"; seq?: number; mime: string; width: number; height: number; data: string }
   | { type: "start"; startsAt: number }
   | { type: "reset" }
   | { type: "error"; message: string }
@@ -312,9 +312,19 @@ function drawFrame(frame: Extract<ServerMessage, { type: "frame" }>): void {
   }
 
   const image = new Image();
+  const ackFrame = (): void => {
+    // Ack only once the frame is decoded, so the host paces new frames to our true
+    // consumption rate instead of running ahead into an unbounded backlog (which is
+    // what made the latency readout climb into the tens of seconds).
+    if (typeof frame.seq === "number") {
+      send({ type: "frame_ack", seq: frame.seq });
+    }
+  };
   image.onload = () => {
     canvasContext.drawImage(image, 0, 0, els.canvas.width, els.canvas.height);
+    ackFrame();
   };
+  image.onerror = ackFrame;
   image.src = `data:${frame.mime};base64,${frame.data}`;
 }
 

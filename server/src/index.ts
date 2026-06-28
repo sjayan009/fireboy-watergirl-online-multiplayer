@@ -19,7 +19,8 @@ type ClientMessage =
   | { type: "input_key"; code: string; action: InputAction }
   | { type: "pointer"; action: "down" | "up" | "click"; x: number; y: number }
   | { type: "reset" }
-  | { type: "ping"; sentAt: number };
+  | { type: "ping"; sentAt: number }
+  | { type: "frame_ack"; seq: number };
 
 type Client = {
   id: string;
@@ -29,6 +30,14 @@ type Client = {
   ready: boolean;
   pressed: Set<string>;
   lastSeen: number;
+  // Per-client frame flow control. We only push a new frame once the client has
+  // acked (decoded) earlier ones, so a slow downlink can't build an unbounded
+  // backlog. `acksFrames` stays false for legacy clients that never ack, which
+  // fall back to the buffer-only path so they keep streaming.
+  framesInFlight: number;
+  lastAckedSeq: number;
+  lastFrameSentAt: number;
+  acksFrames: boolean;
 };
 
 type Room = {
@@ -47,6 +56,7 @@ type Room = {
   screencastHandler: ((frame: ScreencastFramePayload) => void) | null;
   lastFrameAt: number;
   lastSentAt: number;
+  frameSeq: number;
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,11 +69,19 @@ const port = Number(process.env.PORT ?? 8080);
 const localHost = host === "0.0.0.0" ? "127.0.0.1" : host;
 const clientTimeoutMs = Number(process.env.CLIENT_TIMEOUT_MS ?? 30_000);
 const heartbeatMs = Number(process.env.HEARTBEAT_MS ?? 10_000);
-// Drop frames for a client once its WebSocket send buffer exceeds this many bytes.
-// Without this cap a slow link (e.g. a home PC behind a tunnel) lets frames pile up
-// unboundedly; every later message - including the latency ping's pong - then waits
-// behind the backlog, so reported latency climbs into the tens of seconds and the
-// stream falls that far behind real time.
+// Primary backpressure: cap how many frames can be in flight (sent but not yet
+// acked) to a client. The client acks each frame once it has decoded it, so the
+// producer self-clocks to the client's true end-to-end rate and a slow downlink
+// can never build an unbounded backlog. This works regardless of topology - unlike
+// ws.bufferedAmount, which is blind when a fast local proxy (e.g. cloudflared over
+// loopback) drains the host socket instantly and re-buffers downstream.
+const maxFramesInFlight = Math.max(1, Number(process.env.MAX_FRAMES_IN_FLIGHT ?? 2));
+// If a client's outstanding frame isn't acked within this long, assume the ack was
+// lost (or the client stalled) and resume sending so the stream can't freeze.
+const frameAckTimeoutMs = Number(process.env.FRAME_ACK_TIMEOUT_MS ?? 1_500);
+// Secondary, cheap safety valve: skip a client whose local send buffer is backed up.
+// Effective only when the slow consumer is the immediate socket peer; kept as a guard
+// behind the ack-based control above.
 const frameBufferLimit = Number(process.env.MAX_FRAME_BUFFER_BYTES ?? 512_000);
 const rooms = new Map<string, Room>();
 const clients = new Map<string, Client>();
@@ -85,7 +103,11 @@ wss.on("connection", (ws) => {
     role: null,
     ready: false,
     pressed: new Set(),
-    lastSeen: Date.now()
+    lastSeen: Date.now(),
+    framesInFlight: 0,
+    lastAckedSeq: 0,
+    lastFrameSentAt: 0,
+    acksFrames: false
   };
 
   clients.set(client.id, client);
@@ -190,6 +212,11 @@ async function handleMessage(client: Client, raw: string): Promise<void> {
     return;
   }
 
+  if (message.type === "frame_ack") {
+    handleFrameAck(client, message.seq);
+    return;
+  }
+
   if (!client.room) {
     sendError(client, "Join a room first.");
     return;
@@ -279,6 +306,7 @@ function pauseRoom(room: Room, message: string): void {
   for (const client of room.clients.values()) {
     releaseClientKeys(client);
     client.ready = false;
+    client.framesInFlight = 0;
     sendError(client, message);
   }
 
@@ -385,6 +413,7 @@ async function resetRoom(room: Room): Promise<void> {
   for (const client of room.clients.values()) {
     releaseClientKeys(client);
     client.ready = false;
+    client.framesInFlight = 0;
   }
 
   room.phase = "lobby";
@@ -496,7 +525,8 @@ function getRoom(code: string): Room {
     screencasting: false,
     screencastHandler: null,
     lastFrameAt: 0,
-    lastSentAt: 0
+    lastSentAt: 0,
+    frameSeq: 0
   };
 
   rooms.set(code, room);
@@ -583,6 +613,7 @@ async function recreateRoomPage(room: Room, reason: string): Promise<void> {
   for (const client of room.clients.values()) {
     releaseClientKeys(client);
     client.ready = false;
+    client.framesInFlight = 0;
   }
 
   const oldPage = room.page;
@@ -695,8 +726,10 @@ async function onScreencastFrame(
   }
   room.lastSentAt = now;
 
-  broadcastFrame(room, {
+  const seq = ++room.frameSeq;
+  broadcastFrame(room, now, seq, {
     type: "frame",
+    seq,
     mime: "image/jpeg",
     width: 640,
     height: 480,
@@ -814,18 +847,15 @@ function broadcast(room: Room, payload: unknown): void {
 }
 
 // Frames are high-rate and large, so they get their own path: serialize once, and
-// skip any client whose send buffer is already backed up. Dropping a frame keeps the
-// buffer bounded so control messages (including latency pings) stay near real time.
-// A live stream is always better served by the next fresh frame than a stale queued one.
-function broadcastFrame(room: Room, payload: unknown): void {
+// only send to clients that can take another frame right now (see canSendFrameTo).
+// Skipping a frame keeps every downstream buffer bounded so control messages -
+// including the latency ping's pong - stay near real time. A live stream is always
+// better served by the next fresh frame than a stale queued one.
+function broadcastFrame(room: Room, now: number, seq: number, payload: unknown): void {
   let message: string | null = null;
 
   for (const client of room.clients.values()) {
-    if (client.ws.readyState !== client.ws.OPEN) {
-      continue;
-    }
-
-    if (client.ws.bufferedAmount > frameBufferLimit) {
+    if (!canSendFrameTo(client, now)) {
       continue;
     }
 
@@ -833,6 +863,63 @@ function broadcastFrame(room: Room, payload: unknown): void {
       message = JSON.stringify(payload);
     }
     client.ws.send(message);
+    client.framesInFlight += 1;
+    client.lastFrameSentAt = now;
+  }
+}
+
+function canSendFrameTo(client: Client, now: number): boolean {
+  if (client.ws.readyState !== client.ws.OPEN) {
+    return false;
+  }
+
+  // Cheap secondary guard: don't pile onto an already-backed-up local socket buffer.
+  if (client.ws.bufferedAmount > frameBufferLimit) {
+    return false;
+  }
+
+  // Legacy clients that never ack frames fall back to the buffer-only path so they
+  // keep streaming instead of stalling on an in-flight cap they can't satisfy.
+  if (!client.acksFrames) {
+    return true;
+  }
+
+  if (client.framesInFlight < maxFramesInFlight) {
+    return true;
+  }
+
+  // At the cap: only resume if the outstanding frame has gone unacked too long, so a
+  // lost ack (or a brief client stall) can't freeze the stream permanently.
+  if (now - client.lastFrameSentAt >= frameAckTimeoutMs) {
+    client.framesInFlight = 0;
+    return true;
+  }
+
+  return false;
+}
+
+// Each ack means the client has decoded one frame, freeing an in-flight slot. The
+// first ack switches the client onto the ack-gated path (and resets stale bootstrap
+// accounting); the monotonic seq guard ignores duplicate or out-of-order acks.
+function handleFrameAck(client: Client, seq: number): void {
+  if (typeof seq !== "number" || !Number.isFinite(seq)) {
+    return;
+  }
+
+  if (!client.acksFrames) {
+    client.acksFrames = true;
+    client.framesInFlight = 0;
+    client.lastAckedSeq = seq;
+    return;
+  }
+
+  if (seq <= client.lastAckedSeq) {
+    return;
+  }
+
+  client.lastAckedSeq = seq;
+  if (client.framesInFlight > 0) {
+    client.framesInFlight -= 1;
   }
 }
 
