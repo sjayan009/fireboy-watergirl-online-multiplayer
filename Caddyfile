@@ -1,0 +1,8 @@
+# Caddy auto-HTTPS reverse proxy for the cloud game host.
+# SITE_ADDRESS is your public hostname (e.g. your-name.duckdns.org), supplied via
+# the .env file read by docker-compose. Caddy obtains and renews a Let's Encrypt
+# certificate automatically (HTTP-01 challenge), so the Vercel frontend can connect
+# over wss://. WebSocket upgrades are proxied transparently - no extra config needed.
+{$SITE_ADDRESS} {
+	reverse_proxy game-host:8080
+}

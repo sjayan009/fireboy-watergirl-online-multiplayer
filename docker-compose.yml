@@ -1,0 +1,47 @@
+# Production deploy for the cloud game host (see README "Option C - Hetzner VPS").
+#
+# On the VPS, create a .env file next to this one:
+#   SITE_ADDRESS=your-name.duckdns.org
+# then:
+#   docker compose up -d --build
+#
+# Caddy terminates TLS for SITE_ADDRESS and reverse-proxies to the game host, which
+# is never published to the internet directly (only reachable on the compose network).
+services:
+  game-host:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8080" # internal only - reached via the Caddy reverse proxy, never published
+    environment:
+      NODE_ENV: "production"
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      # Smoothness tuning for a dedicated 4-vCPU box + low (~20ms) RTT. If the host
+      # CPU runs hot under play, raise FRAME_INTERVAL_MS toward 50 (fewer fps) or
+      # drop FRAME_QUALITY toward 55 (smaller frames). See README "Host tuning".
+      FRAME_INTERVAL_MS: "33"
+      FRAME_QUALITY: "65"
+      MAX_FRAMES_IN_FLIGHT: "2"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - game-host
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      SITE_ADDRESS: "${SITE_ADDRESS:?set SITE_ADDRESS in .env, e.g. your-name.duckdns.org}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # persists the Let's Encrypt certificate across restarts
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

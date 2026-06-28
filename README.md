@@ -84,7 +84,37 @@ npm run smoke:host
 
 ## Deployment
 
-The frontend stays on Vercel. The game host needs an always-on backend. Pick one of the two options below, then point Vercel at it.
+The frontend stays on Vercel. The game host needs an always-on backend. Pick one of the three options below, then point Vercel at it. **Option C is recommended** - a dedicated VPS close to your players gives the smoothest, lowest-latency experience for the least money.
+
+### Option C - Hetzner VPS in Ashburn, VA (recommended, ~$10-16/mo)
+
+The host is CPU-bound (Chromium + Ruffle + JPEG encoding) and latency-bound (every keypress round-trips through it), so the two things that matter are **a dedicated CPU** and **a location close to your players**. For US East Coast players (e.g. Connecticut + Georgia), **Ashburn, Virginia** is the equidistant sweet spot (~15-25 ms to both). Hetzner has a datacenter there with strong AMD CPUs at hobby prices.
+
+This runs the existing `server/Dockerfile` plus a [Caddy](https://caddyserver.com) reverse proxy (automatic Let's Encrypt TLS) via `docker-compose.yml`, using a free [DuckDNS](https://www.duckdns.org) hostname for `wss://`.
+
+1. **Provision** a Hetzner Cloud server in **Ashburn, VA** - `CPX31` (4 vCPU / 8 GB, smoothest) or `CPX21` (3 vCPU / 4 GB, cheapest), Ubuntu 24.04. Note its static IPv4. In the Hetzner firewall, allow only ports **22, 80, 443**.
+2. **DuckDNS** (free): create a subdomain at https://www.duckdns.org and set its IP to the server's IPv4. The VPS IP is static, so no updater is needed.
+3. **Install Docker** on the VPS (`curl -fsSL https://get.docker.com | sh`), then `git clone` this repo.
+4. Create a `.env` file next to `docker-compose.yml`:
+
+   ```bash
+   SITE_ADDRESS=your-name.duckdns.org
+   ```
+
+5. **Launch:**
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   Caddy fetches the TLS certificate on first start (give it ~30 s). Verify: `curl -I https://your-name.duckdns.org/health` returns `200`.
+6. Point Vercel at it and redeploy:
+
+   ```bash
+   VITE_GAME_SERVER_URL=wss://your-name.duckdns.org
+   ```
+
+Frame-rate/quality are pre-tuned for a 4-vCPU box in `docker-compose.yml` (`FRAME_INTERVAL_MS`, `FRAME_QUALITY`); see **Host tuning** above to adjust. To update later: `git pull && docker compose up -d --build`.
 
 ### Option A - Your own PC + Cloudflare Tunnel (default, free)
 
