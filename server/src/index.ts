@@ -59,6 +59,12 @@ const port = Number(process.env.PORT ?? 8080);
 const localHost = host === "0.0.0.0" ? "127.0.0.1" : host;
 const clientTimeoutMs = Number(process.env.CLIENT_TIMEOUT_MS ?? 30_000);
 const heartbeatMs = Number(process.env.HEARTBEAT_MS ?? 10_000);
+// Drop frames for a client once its WebSocket send buffer exceeds this many bytes.
+// Without this cap a slow link (e.g. a home PC behind a tunnel) lets frames pile up
+// unboundedly; every later message - including the latency ping's pong - then waits
+// behind the backlog, so reported latency climbs into the tens of seconds and the
+// stream falls that far behind real time.
+const frameBufferLimit = Number(process.env.MAX_FRAME_BUFFER_BYTES ?? 512_000);
 const rooms = new Map<string, Room>();
 const clients = new Map<string, Client>();
 
@@ -689,7 +695,7 @@ async function onScreencastFrame(
   }
   room.lastSentAt = now;
 
-  broadcast(room, {
+  broadcastFrame(room, {
     type: "frame",
     mime: "image/jpeg",
     width: 640,
@@ -804,6 +810,29 @@ function broadcastRoomState(room: Room): void {
 function broadcast(room: Room, payload: unknown): void {
   for (const client of room.clients.values()) {
     send(client, payload);
+  }
+}
+
+// Frames are high-rate and large, so they get their own path: serialize once, and
+// skip any client whose send buffer is already backed up. Dropping a frame keeps the
+// buffer bounded so control messages (including latency pings) stay near real time.
+// A live stream is always better served by the next fresh frame than a stale queued one.
+function broadcastFrame(room: Room, payload: unknown): void {
+  let message: string | null = null;
+
+  for (const client of room.clients.values()) {
+    if (client.ws.readyState !== client.ws.OPEN) {
+      continue;
+    }
+
+    if (client.ws.bufferedAmount > frameBufferLimit) {
+      continue;
+    }
+
+    if (message === null) {
+      message = JSON.stringify(payload);
+    }
+    client.ws.send(message);
   }
 }
 

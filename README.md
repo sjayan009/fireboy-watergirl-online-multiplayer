@@ -19,6 +19,7 @@ The public Vercel site is only the viewer/controller. The actual game runs once 
 The host reads these at startup; defaults are sensible for a typical desktop:
 
 - `FRAME_INTERVAL_MS` (150) - minimum gap between frames sent to clients; raise to cut bandwidth, lower for smoother motion.
+- `MAX_FRAME_BUFFER_BYTES` (512000) - per-client send-buffer cap. When a client's WebSocket buffer is fuller than this, new frames are dropped for that client instead of queued, so a slow link can't build a backlog that inflates latency and lags the stream. Raise to tolerate brief bursts, lower to favor freshness on slow links.
 - `FRAME_QUALITY` (60) - JPEG quality, 1-100.
 - `SCREENCAST_NTH` (1) - capture every Nth rendered frame; raise to reduce host CPU on weaker machines.
 - `FRAME_TIMEOUT_MS` (8000) - how long without a frame counts as a stall.
