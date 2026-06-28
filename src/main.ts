@@ -307,19 +307,23 @@ function handleServerMessage(message: ServerMessage): void {
 }
 
 function drawFrame(frame: Extract<ServerMessage, { type: "frame" }>): void {
-  if (!canvasContext) {
-    return;
-  }
-
-  const image = new Image();
   const ackFrame = (): void => {
-    // Ack only once the frame is decoded, so the host paces new frames to our true
-    // consumption rate instead of running ahead into an unbounded backlog (which is
-    // what made the latency readout climb into the tens of seconds).
+    // Ack so the host paces new frames to our true consumption rate instead of
+    // running ahead into an unbounded backlog (which is what made the latency
+    // readout climb into the tens of seconds). Normally this fires once the frame is
+    // decoded (onload) so the host also can't outrun our decode; onerror and the
+    // no-canvas path below still ack so a render failure can't disable flow control.
     if (typeof frame.seq === "number") {
       send({ type: "frame_ack", seq: frame.seq });
     }
   };
+
+  if (!canvasContext) {
+    ackFrame();
+    return;
+  }
+
+  const image = new Image();
   image.onload = () => {
     canvasContext.drawImage(image, 0, 0, els.canvas.width, els.canvas.height);
     ackFrame();

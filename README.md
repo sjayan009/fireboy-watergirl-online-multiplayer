@@ -18,7 +18,7 @@ The public Vercel site is only the viewer/controller. The actual game runs once 
 
 The host reads these at startup; defaults are sensible for a typical desktop:
 
-- `FRAME_INTERVAL_MS` (150) - minimum gap between frames sent to clients; raise to cut bandwidth, lower for smoother motion.
+- `FRAME_INTERVAL_MS` (50) - minimum gap between frames sent to clients, i.e. the frame-rate ceiling (~20 fps). Flow control (below) drops, never queues, frames a client can't keep up with, so this is just a ceiling: fast links approach it, slow links self-limit. Raise to cut bandwidth, lower for smoother motion.
 - `MAX_FRAMES_IN_FLIGHT` (2) - primary backpressure. The host sends a client at most this many frames before that client acks (decodes) them, so the producer self-clocks to each client's real end-to-end speed and a slow downlink can't build an unbounded backlog. Lower (1) for the tightest latency on slow links; raise for smoother motion on fast ones. This is the knob that keeps the latency readout from climbing.
 - `FRAME_ACK_TIMEOUT_MS` (1500) - if a client's outstanding frame goes unacked this long, the host assumes the ack was lost and resumes sending so the stream can't freeze.
 - `MAX_FRAME_BUFFER_BYTES` (512000) - secondary safety valve only. Skips a client whose local socket buffer is backed up. Note this is blind behind a tunnel that drains the host socket over loopback (e.g. cloudflared), which is why `MAX_FRAMES_IN_FLIGHT` is the real control.
