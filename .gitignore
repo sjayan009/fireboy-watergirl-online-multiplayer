@@ -6,6 +6,11 @@ dist
 .vercel
 *.log
 
+# Cloudflare Tunnel live config and credentials (keep only the example).
+/cloudflared/config.yml
+/cloudflared/*.json
+/cloudflared/cert.pem
+
 # Original archive payload retained outside the web app.
 /00_coverscreenshot.png
 /00_coverscreenshot_thumb.jpg

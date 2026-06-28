@@ -1,0 +1,29 @@
+# Cloudflare Tunnel config for the Fireboy & Watergirl game host.
+#
+# Copy this file to cloudflared/config.yml and fill in your values.
+# config.yml and the *.json credentials are gitignored on purpose.
+#
+# One-time setup (run from any terminal after installing cloudflared):
+#   cloudflared tunnel login
+#   cloudflared tunnel create fireboy-watergirl
+#   cloudflared tunnel route dns fireboy-watergirl game.YOURDOMAIN.com
+#
+# Then run the tunnel (with the game host already listening on :8080):
+#   cloudflared tunnel --config cloudflared/config.yml run
+#   # or: pwsh scripts/tunnel.ps1
+
+# UUID printed by `cloudflared tunnel create` (it is also the credentials filename).
+tunnel: <TUNNEL-UUID>
+
+# `cloudflared tunnel create` writes this file. On Windows it lives under
+# %USERPROFILE%\.cloudflared\<TUNNEL-UUID>.json
+credentials-file: C:\Users\<you>\.cloudflared\<TUNNEL-UUID>.json
+
+ingress:
+  # Public hostname players connect to -> the local game host on this PC.
+  # Cloudflare proxies the WebSocket (/ws) over this automatically; no extra config needed.
+  - hostname: game.YOURDOMAIN.com
+    service: http://localhost:8080
+
+  # Required catch-all rule.
+  - service: http_status:404

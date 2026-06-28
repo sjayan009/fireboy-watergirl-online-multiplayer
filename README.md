@@ -7,13 +7,23 @@ The public Vercel site is only the viewer/controller. The actual game runs once 
 ## Architecture
 
 - Frontend: Vite + TypeScript, deployed on Vercel.
-- Game host: Node + Playwright + WebSocket, intended for Fly.io.
-- One room creates one server-side Chromium page.
-- v1 runs as a single Fly machine because room state and Chromium pages are in memory.
-- The Fly machine is configured with 2 GB RAM so Chromium/Ruffle cold starts have breathing room.
+- Game host: Node + Playwright + WebSocket. It needs an **always-on** home; the default below is your own PC exposed through a Cloudflare Tunnel, with Fly.io as a paid alternative.
+- One room creates one server-side Chromium page; room state and Chromium pages live in memory, so the host is a single long-lived process.
+- Frames are streamed with CDP screencast (`Page.startScreencast`), which pushes JPEG frames as the page renders instead of polling screenshots. A watchdog restarts the screencast on a transient stall and only recreates the page after repeated strikes.
 - Fireboy controls: ArrowLeft / ArrowUp / ArrowRight.
 - Watergirl controls: A / W / D.
 - Pointer events on the streamed game view are forwarded to the hosted game so players can click the in-game menu.
+
+### Host tuning (env vars)
+
+The host reads these at startup; defaults are sensible for a typical desktop:
+
+- `FRAME_INTERVAL_MS` (150) - minimum gap between frames sent to clients; raise to cut bandwidth, lower for smoother motion.
+- `FRAME_QUALITY` (60) - JPEG quality, 1-100.
+- `SCREENCAST_NTH` (1) - capture every Nth rendered frame; raise to reduce host CPU on weaker machines.
+- `FRAME_TIMEOUT_MS` (8000) - how long without a frame counts as a stall.
+- `FRAME_MAX_STRIKES` (4) - consecutive stalls before the page is recreated.
+- `WATCHDOG_INTERVAL_MS` (2000) - how often the stall check runs.
 
 ## Local Setup
 
@@ -71,14 +81,50 @@ npm run smoke:host
 
 ## Deployment
 
-Deploy the host service to Fly.io from the repo root:
+The frontend stays on Vercel. The game host needs an always-on backend. Pick one of the two options below, then point Vercel at it.
+
+### Option A - Your own PC + Cloudflare Tunnel (default, free)
+
+Runs the host on this machine and exposes it at a stable `https://`/`wss://` hostname through Cloudflare. Your PC must stay on while people play.
+
+1. Install the tunnel client: `winget install --id Cloudflare.cloudflared`
+2. One-time tunnel setup (needs a free Cloudflare account with a domain on Cloudflare DNS):
+
+   ```bash
+   cloudflared tunnel login
+   cloudflared tunnel create fireboy-watergirl
+   cloudflared tunnel route dns fireboy-watergirl game.YOURDOMAIN.com
+   ```
+
+3. Copy `cloudflared/config.example.yml` to `cloudflared/config.yml` and fill in the tunnel UUID, credentials path, and hostname.
+4. Start the host, then the tunnel (two terminals):
+
+   ```bash
+   npm run server:dev
+   ```
+
+   ```powershell
+   pwsh scripts/tunnel.ps1
+   ```
+
+5. Set the Vercel env var to your tunnel hostname and redeploy:
+
+   ```bash
+   VITE_GAME_SERVER_URL=wss://game.YOURDOMAIN.com
+   ```
+
+For 24/7 hosting, install cloudflared as a Windows service (`cloudflared service install`) so the tunnel survives reboots, and keep the host process running (e.g. via a startup task or `pm2`).
+
+**No domain yet?** Run `pwsh scripts/tunnel.ps1 -Quick` for an ephemeral `*.trycloudflare.com` URL - no account or domain needed, but the URL changes every run, so update `VITE_GAME_SERVER_URL` and redeploy each time. Good for testing, not for a stable link.
+
+### Option B - Fly.io (paid, always-on)
+
+The repo ships a `fly.toml` and `server/Dockerfile`. Fly organizations require a payment method (the free trial stops machines after 5 minutes), and `shared-cpu-1x` is marginal for Chromium + Ruffle - bump to `shared-cpu-2x`/`4x` (or `performance-1x`) in `fly.toml` before relying on it.
 
 ```bash
 fly launch --copy-config
 fly deploy
 ```
-
-Set the Vercel frontend env var:
 
 ```bash
 VITE_GAME_SERVER_URL=wss://fireboy-watergirl-game-host.fly.dev

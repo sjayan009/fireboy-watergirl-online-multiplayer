@@ -10,6 +10,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 type Role = "fireboy" | "watergirl";
 type Phase = "lobby" | "starting" | "playing";
 type InputAction = "down" | "up";
+type ScreencastFramePayload = { data: string; sessionId: number };
 
 type ClientMessage =
   | { type: "join_room"; room: string; playerId?: string }
@@ -40,9 +41,12 @@ type Room = {
   frameTimer: NodeJS.Timeout | null;
   cleanupTimer: NodeJS.Timeout | null;
   loading: Promise<void> | null;
-  frameInFlight: boolean;
   frameFailures: number;
   recovering: boolean;
+  screencasting: boolean;
+  screencastHandler: ((frame: ScreencastFramePayload) => void) | null;
+  lastFrameAt: number;
+  lastSentAt: number;
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -259,6 +263,8 @@ function activateRoom(activeRoom: Room): void {
 }
 
 function pauseRoom(room: Room, message: string): void {
+  stopScreencast(room);
+
   if (room.frameTimer) {
     clearInterval(room.frameTimer);
     room.frameTimer = null;
@@ -274,7 +280,6 @@ function pauseRoom(room: Room, message: string): void {
   const oldCdpSession = room.cdpSession;
   room.phase = "lobby";
   room.startsAt = null;
-  room.frameInFlight = false;
   room.frameFailures = 0;
   room.cdpSession = null;
   room.page = null;
@@ -379,6 +384,8 @@ async function resetRoom(room: Room): Promise<void> {
   room.phase = "lobby";
   room.startsAt = null;
 
+  stopScreencast(room);
+
   try {
     await room.page?.reload({ waitUntil: "domcontentloaded" });
     await room.page?.waitForSelector("#game-root ruffle-player", { timeout: 30_000 });
@@ -389,6 +396,8 @@ async function resetRoom(room: Room): Promise<void> {
     return;
   }
 
+  room.lastFrameAt = Date.now();
+  await startScreencast(room);
   broadcast(room, { type: "reset" });
   broadcastRoomState(room);
 }
@@ -476,9 +485,12 @@ function getRoom(code: string): Room {
     frameTimer: null,
     cleanupTimer: null,
     loading: null,
-    frameInFlight: false,
     frameFailures: 0,
-    recovering: false
+    recovering: false,
+    screencasting: false,
+    screencastHandler: null,
+    lastFrameAt: 0,
+    lastSentAt: 0
   };
 
   rooms.set(code, room);
@@ -555,6 +567,8 @@ async function recreateRoomPage(room: Room, reason: string): Promise<void> {
 
   room.recovering = true;
 
+  stopScreencast(room);
+
   if (room.frameTimer) {
     clearInterval(room.frameTimer);
     room.frameTimer = null;
@@ -571,7 +585,6 @@ async function recreateRoomPage(room: Room, reason: string): Promise<void> {
   room.cdpSession = null;
   room.phase = "lobby";
   room.startsAt = null;
-  room.frameInFlight = false;
   room.frameFailures = 0;
 
   await oldCdpSession?.detach().catch(() => {});
@@ -595,16 +608,107 @@ async function recreateRoomPage(room: Room, reason: string): Promise<void> {
 }
 
 function startFrameLoop(room: Room): void {
-  if (!isActiveRoom(room) || room.frameTimer || !room.page) {
+  if (!isActiveRoom(room) || !room.page) {
+    return;
+  }
+
+  void startScreencast(room);
+  startWatchdog(room);
+}
+
+async function startScreencast(room: Room): Promise<void> {
+  if (!isActiveRoom(room) || !room.page || !room.cdpSession || room.screencasting) {
+    return;
+  }
+
+  const session = room.cdpSession;
+  const handler = (frame: ScreencastFramePayload): void => {
+    void onScreencastFrame(room, session, frame);
+  };
+
+  session.on("Page.screencastFrame", handler);
+  room.screencastHandler = handler;
+  room.screencasting = true;
+  room.lastFrameAt = Date.now();
+
+  try {
+    await session.send("Page.startScreencast", {
+      format: "jpeg",
+      quality: Number(process.env.FRAME_QUALITY ?? 60),
+      maxWidth: 640,
+      maxHeight: 480,
+      everyNthFrame: Number(process.env.SCREENCAST_NTH ?? 1)
+    });
+  } catch (error) {
+    console.error(`Could not start screencast for room ${room.code}`, error);
+    stopScreencast(room);
+  }
+}
+
+function stopScreencast(room: Room): void {
+  const session = room.cdpSession;
+  const handler = room.screencastHandler;
+
+  if (session && handler) {
+    session.off("Page.screencastFrame", handler);
+    void session.send("Page.stopScreencast").catch(() => {});
+  }
+
+  room.screencastHandler = null;
+  room.screencasting = false;
+}
+
+async function onScreencastFrame(
+  room: Room,
+  session: CDPSession,
+  frame: ScreencastFramePayload
+): Promise<void> {
+  // The screencast pipeline stalls unless every frame is acknowledged, so ack first -
+  // even for frames we throttle away below.
+  try {
+    await session.send("Page.screencastFrameAck", { sessionId: frame.sessionId });
+  } catch {
+    return;
+  }
+
+  if (!isActiveRoom(room) || room.cdpSession !== session) {
+    return;
+  }
+
+  const now = Date.now();
+  room.lastFrameAt = now;
+  room.frameFailures = 0;
+
+  if (room.clients.size === 0 || !frame.data) {
+    return;
+  }
+
+  const minInterval = Number(process.env.FRAME_INTERVAL_MS ?? 150);
+  if (now - room.lastSentAt < minInterval) {
+    return;
+  }
+  room.lastSentAt = now;
+
+  broadcast(room, {
+    type: "frame",
+    mime: "image/jpeg",
+    width: 640,
+    height: 480,
+    data: frame.data
+  });
+}
+
+function startWatchdog(room: Room): void {
+  if (room.frameTimer) {
     return;
   }
 
   room.frameTimer = setInterval(() => {
-    void sendFrame(room);
-  }, Number(process.env.FRAME_INTERVAL_MS ?? 250));
+    void checkStream(room);
+  }, Number(process.env.WATCHDOG_INTERVAL_MS ?? 2_000));
 }
 
-async function sendFrame(room: Room): Promise<void> {
+async function checkStream(room: Room): Promise<void> {
   if (!isActiveRoom(room)) {
     if (room.frameTimer) {
       clearInterval(room.frameTimer);
@@ -613,44 +717,28 @@ async function sendFrame(room: Room): Promise<void> {
     return;
   }
 
-  if (!room.page || room.clients.size === 0 || room.frameInFlight || room.recovering) {
+  if (!room.page || room.clients.size === 0 || room.recovering) {
     return;
   }
 
-  room.frameInFlight = true;
-
-  try {
-    room.cdpSession ??= await room.page.context().newCDPSession(room.page);
-    const frame = await withTimeout(room.cdpSession.send("Page.captureScreenshot", {
-      format: "jpeg",
-      quality: Number(process.env.FRAME_QUALITY ?? 62),
-      captureBeyondViewport: false,
-      clip: { x: 0, y: 0, width: 640, height: 480, scale: 1 }
-    }), Number(process.env.FRAME_TIMEOUT_MS ?? 5_000));
-
-    const data = (frame as { data: string }).data;
-    if (!data) {
-      throw new Error("CDP screenshot returned no frame data.");
-    }
-
-    room.frameFailures = 0;
-    broadcast(room, {
-      type: "frame",
-      mime: "image/jpeg",
-      width: 640,
-      height: 480,
-      data
-    });
-  } catch (error) {
-    room.frameFailures += 1;
-    console.error(`Frame capture failed for room ${room.code}`, error);
-
-    if (room.frameFailures >= 3) {
-      await recreateRoomPage(room, "frame capture failures");
-    }
-  } finally {
-    room.frameInFlight = false;
+  const stallMs = Number(process.env.FRAME_TIMEOUT_MS ?? 8_000);
+  if (Date.now() - room.lastFrameAt < stallMs) {
+    return;
   }
+
+  room.frameFailures += 1;
+  console.error(`Frame stream stalled for room ${room.code} (strike ${room.frameFailures}).`);
+
+  const maxStrikes = Number(process.env.FRAME_MAX_STRIKES ?? 4);
+  if (room.frameFailures >= maxStrikes) {
+    await recreateRoomPage(room, "frame stream stalled");
+    return;
+  }
+
+  // A transient stall just restarts the screencast; only repeated strikes recreate the page.
+  stopScreencast(room);
+  room.lastFrameAt = Date.now();
+  await startScreencast(room);
 }
 
 function adoptClientId(client: Client, requestedId: string | undefined): void {
@@ -680,6 +768,8 @@ function normalizePlayerId(playerId: string | undefined): string | null {
 }
 
 async function disposeRoom(room: Room): Promise<void> {
+  stopScreencast(room);
+
   if (room.frameTimer) {
     clearInterval(room.frameTimer);
     room.frameTimer = null;
@@ -788,25 +878,6 @@ function clamp(value: number, min: number, max: number): number {
   }
 
   return Math.max(min, Math.min(max, value));
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timeout: NodeJS.Timeout | null = null;
-
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timeout = setTimeout(() => {
-          reject(new Error(`Timed out after ${timeoutMs}ms.`));
-        }, timeoutMs);
-      })
-    ]);
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  }
 }
 
 function statusPageHtml(): string {
