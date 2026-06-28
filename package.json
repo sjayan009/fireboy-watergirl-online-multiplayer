@@ -10,6 +10,7 @@
     "server:build": "npm run build --prefix server",
     "build:all": "npm run build && npm run server:build",
     "smoke:host": "node scripts/host-smoke.mjs",
+    "smoke:prod": "node scripts/remote-smoke.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -206,7 +206,7 @@ function connect(): void {
 
   socket.addEventListener("open", () => {
     connectionState = "connected";
-    send({ type: "join_room", room });
+    send({ type: "join_room", room, playerId });
     startPing();
     render();
   });
@@ -215,8 +215,24 @@ function connect(): void {
     handleServerMessage(JSON.parse(event.data as string) as ServerMessage);
   });
 
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
+    if (event.code === 4001) {
+      connectionState = "offline";
+      players = [];
+      ready = false;
+      phase = "lobby";
+      startsAt = null;
+      stopPing();
+      showToast("This room was closed because another room started.");
+      render();
+      return;
+    }
+
     connectionState = "degraded";
+    players = [];
+    ready = false;
+    phase = "lobby";
+    startsAt = null;
     stopPing();
     render();
     reconnectTimer = window.setTimeout(connect, 1500);
@@ -224,6 +240,8 @@ function connect(): void {
 
   socket.addEventListener("error", () => {
     connectionState = "degraded";
+    players = [];
+    ready = false;
     render();
   });
 }

@@ -1,6 +1,19 @@
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PLAYER_ID_KEY = "fireboy-watergirl-player-id";
+
 export function getOrCreatePlayerId(): string {
-  return crypto.randomUUID();
+  try {
+    const existing = sessionStorage.getItem(PLAYER_ID_KEY);
+    if (existing) {
+      return existing;
+    }
+
+    const playerId = crypto.randomUUID();
+    sessionStorage.setItem(PLAYER_ID_KEY, playerId);
+    return playerId;
+  } catch {
+    return crypto.randomUUID();
+  }
 }
 
 export function getInitialRoom(): string {
