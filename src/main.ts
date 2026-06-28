@@ -28,6 +28,7 @@ let ready = false;
 let phase: Phase = "lobby";
 let startsAt: number | null = null;
 let connectionState: ConnectionState = "connecting";
+let connectionDetail = "Connecting to the cloud game host.";
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let pingTimer: number | null = null;
@@ -193,10 +194,12 @@ function connect(): void {
 
   socket?.close();
   connectionState = "connecting";
+  connectionDetail = "Connecting to the cloud game host.";
   const url = gameServerUrl();
 
   if (!url) {
     connectionState = "offline";
+    connectionDetail = "Set VITE_GAME_SERVER_URL to connect to the cloud host.";
     showToast("Set VITE_GAME_SERVER_URL to connect to the cloud host.");
     render();
     return;
@@ -218,17 +221,19 @@ function connect(): void {
   socket.addEventListener("close", (event) => {
     if (event.code === 4001) {
       connectionState = "offline";
+      connectionDetail = event.reason || "Another room is already active on this host.";
       players = [];
       ready = false;
       phase = "lobby";
       startsAt = null;
       stopPing();
-      showToast("This room was closed because another room started.");
+      showToast(connectionDetail);
       render();
       return;
     }
 
     connectionState = "degraded";
+    connectionDetail = "Connection dropped. Reconnecting to the cloud game host.";
     players = [];
     ready = false;
     phase = "lobby";
@@ -240,6 +245,7 @@ function connect(): void {
 
   socket.addEventListener("error", () => {
     connectionState = "degraded";
+    connectionDetail = "WebSocket connection failed. Retrying.";
     players = [];
     ready = false;
     render();
@@ -456,8 +462,13 @@ function renderPlayers(): void {
 function renderOverlay(): void {
   if (connectionState !== "connected") {
     els.overlay.hidden = false;
-    els.overlayTitle.textContent = "Connecting";
-    els.overlayCopy.textContent = "Connecting to the cloud game host.";
+    els.overlayTitle.textContent =
+      connectionState === "connecting"
+        ? "Connecting"
+        : connectionState === "degraded"
+          ? "Reconnecting"
+          : "Room unavailable";
+    els.overlayCopy.textContent = connectionDetail;
     return;
   }
 
@@ -521,7 +532,7 @@ function reconcileDesiredState(own: ServerPlayer | undefined): void {
 }
 
 function gameServerUrl(): string | null {
-  const configured = import.meta.env.VITE_GAME_SERVER_URL as string | undefined;
+  const configured = cleanConfiguredUrl(import.meta.env.VITE_GAME_SERVER_URL as string | undefined);
   const base =
     configured ||
     (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
@@ -532,7 +543,12 @@ function gameServerUrl(): string | null {
     return null;
   }
 
-  const url = new URL(base);
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    return null;
+  }
   if (url.protocol === "http:") {
     url.protocol = "ws:";
   }
@@ -543,6 +559,19 @@ function gameServerUrl(): string | null {
     url.pathname = "/ws";
   }
   return url.toString();
+}
+
+function cleanConfiguredUrl(value: string | undefined): string {
+  let next = value?.trim().replace(/^\uFEFF/, "") ?? "";
+
+  if (
+    (next.startsWith('"') && next.endsWith('"')) ||
+    (next.startsWith("'") && next.endsWith("'"))
+  ) {
+    next = next.slice(1, -1).trim().replace(/^\uFEFF/, "");
+  }
+
+  return next;
 }
 
 function connectionLabel(state: ConnectionState): string {
