@@ -94,21 +94,35 @@ This runs the existing `server/Dockerfile` plus a [Caddy](https://caddyserver.co
 
 1. **Provision** a Hetzner Cloud server in **Ashburn, VA** - `CPX31` (4 vCPU / 8 GB, smoothest) or `CPX21` (3 vCPU / 4 GB, cheapest), Ubuntu 24.04. Note its static IPv4. In the Hetzner firewall, allow only ports **22, 80, 443**.
 2. **DuckDNS** (free): create a subdomain at https://www.duckdns.org and set its IP to the server's IPv4. The VPS IP is static, so no updater is needed.
-3. **Install Docker** on the VPS (`curl -fsSL https://get.docker.com | sh`), then `git clone` this repo.
-4. Create a `.env` file next to `docker-compose.yml`:
+3. **Run the VPS setup helper** on the server. Replace the hostname and repo URL with yours:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/scripts/vps-setup.sh | SITE_ADDRESS=your-name.duckdns.org REPO_URL=https://github.com/YOUR_GITHUB_USER/YOUR_REPO.git bash
+   ```
+
+   The helper installs Docker if needed, clones or updates the repo, writes `.env`, starts the Compose stack, and checks `https://your-name.duckdns.org/health`.
+
+   If you already cloned the repo manually, run this from the repo instead:
+
+   ```bash
+   SITE_ADDRESS=your-name.duckdns.org bash scripts/vps-setup.sh
+   ```
+
+4. Or do the same steps manually: install Docker on the VPS (`curl -fsSL https://get.docker.com | sh`), then `git clone` this repo.
+5. Create a `.env` file next to `docker-compose.yml`:
 
    ```bash
    SITE_ADDRESS=your-name.duckdns.org
    ```
 
-5. **Launch:**
+6. **Launch:**
 
    ```bash
    docker compose up -d --build
    ```
 
    Caddy fetches the TLS certificate on first start (give it ~30 s). Verify: `curl -I https://your-name.duckdns.org/health` returns `200`.
-6. Point Vercel at it and redeploy:
+7. Point Vercel at it and redeploy:
 
    ```bash
    VITE_GAME_SERVER_URL=wss://your-name.duckdns.org
